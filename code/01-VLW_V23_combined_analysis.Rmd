@@ -1,0 +1,234 @@
+---
+title: "Analysis of VLW 2Dvs3D combined data"
+output: 
+    html_notebook:
+        self_contained: yes
+author: "Darren R Tyson"
+date: "2020-11-17"
+---
+
+## The `diprate` R package
+You can install the `diprate` R package by following the instructions here: https://github.com/QuLab-VU/dipDRC  
+
+
+### Combining VLW001 and VLW_V23b datasets
+After having fixed the apparent error due to incorrect assignment of missed/temporary barcodes, the VLW001 dataset looks appropriately clean for combining with the VLW_V23b dataset to enable analysis of all four cell line simultaneously and consider analyzing the 3D data.
+
+```{r Setup}
+require(diprate)
+source("../functions/namingStandards.r")
+keep_cols <- c(std_colnames,c("ch2.pos","orig.cell.count","file_name"))
+```
+
+```{r Load data}
+d1 <- read.csv("../data/VLW001_dataset.csv", as.is=TRUE)
+d2 <- read.csv("../data/VLW_V23b_dataset.csv", as.is=TRUE)
+d <- merge(d1,d2, all=TRUE)
+```
+
+
+#### Standardize data
+The VLW001 dataset did not have a calculation for viable cells (`cell.count - ch2.pos`) and several data types with NA values.
+
+Steps to perform:  
+
+* Remove extra columns
+* Calculate viable cells (`cell.count <- orig.cell.count - ch2.pos`)
+* Replace NA in `drug1` as `control` and `drug1.conc` as `0`
+* Calculate fraction of dead cells (`dead.cell.frxn <- ch2.pos/orig.cell.count`)
+* Identify high-density culture (confluence) and remove time points once reached
+
+```{r Quantify viable cells}
+d[is.na(d$orig.cell.count),'orig.cell.count'] <- d[is.na(d$orig.cell.count),'cell.count']
+cc <- d[d$orig.cell.count==d$cell.count,'cell.count'] - 
+    d[d$orig.cell.count==d$cell.count,'ch2.pos']
+d[d$orig.cell.count==d$cell.count & !is.na(d$cell.count),'cell.count'] <- cc[!is.na(cc)]
+rm(cc)
+```
+
+
+```{r Remove extra columns}
+d <- d[,keep_cols]
+d[is.na(d$drug1.conc),'drug1.conc'] <- 0
+d[is.na(d$drug1),'drug1'] <- 'control'
+d <- d[!is.na(d$cell.count),]
+d$drug1.units <- 'M'
+d <- d[order(d$plate.name,d$uid,d$time),]
+d$cell.count[d$cell.count<=0] <- 1
+
+rownames(d) <- NULL
+```
+
+*Modified from `VLW_V23b_analysis.Rmd`*  
+Should exclude wells O14–O20 on drug plate 3 since it appears they really contain drugs.
+```{r}
+d <- d[!(d$well %in% paste0('O',14:20) & grepl("-D3", d$plate.name)),]
+```
+
+Subset 2D cultures only.
+```{r Subset 2D}
+a <- d[grepl("^V2", d$plate.name),]
+```
+
+Perform QC on controls.
+```{r Control QC, fig.height=8, fig.width=8, message=FALSE, warning=FALSE}
+par(mfrow=c(2,2))
+ctrl <- sapply(unique(a$cell.line), function(cl) {
+	controlQC(	a[a$cell.line==cl & a$drug1.conc==0,]$time,
+				a[a$cell.line==cl & a$drug1.conc==0,]$cell.count,
+				a[a$cell.line==cl & a$drug1.conc==0,]$uid,
+				cell.line.name=cl,
+			    min.ar2=0.95,
+				plotIt=TRUE,
+                ret.type="all")
+	}, simplify=FALSE)
+```
+
+Determine maximum number of cells consistent with exponential growth.
+```{r Get max counts, message=FALSE, warning=FALSE}
+max.counts <- sapply(unique(a$cell.line), function(cl) {
+	findMaxCounts(	a[a$cell.line==cl & a$drug1.conc==0,]$time,
+				a[a$cell.line==cl & a$drug1.conc==0,]$cell.count,
+				a[a$cell.line==cl & a$drug1.conc==0,]$uid,
+                min.ar2=0.95)}, 
+	simplify=FALSE)
+
+```
+
+Show histogram of max counts for each cell line.
+```{r fig.height=2, fig.width=8}
+par(mfrow=c(1,4))
+invisible(lapply(names(max.counts), function(n) boxplot(max.counts[[n]]$max.exp.counts, ylim=c(0,2000), main=n)))
+```
+
+#### QC of 16T data
+Appears that cells are reaching confluence during the experiment only for 16T. Identify the max counts where growth has not yet been restricted and use to obtain a reasonable max value to limit data.  
+
+Remove data from 16T when cell count exceeds the max consistent with exponential growth in the control wells. 
+```{r Remove data after max counts}
+max.16T <- quantile(max.counts[['16T']]$max.exp.counts, 0.05)
+uid2filter <- unique(d[d$cell.count>max.16T,'uid'])
+times2filter <- sapply(uid2filter, function(id) min(d[d$uid==id & d$cell.count>max.16T,'time']))
+
+b <- d[d$uid %in% uid2filter,]
+b <- do.call(rbind, lapply(seq_along(uid2filter), function(i) 
+    b[b$uid==uid2filter[i] & b$time <times2filter[i],]))
+
+d <- d[!d$uid %in% uid2filter,]
+d <- rbind(d,b)
+d <- d[order(d$plate.name,d$uid,d$time),]
+a <- d[grepl("^V2", d$plate.name),]
+```
+
+```{r fig.height=11, fig.width=8}
+par(mfcol=c(5,4))
+invisible(lapply(unique(a$plate.name), function(mypn) do.call(plotGC,append(
+    list(ylim=c(0,5), main=mypn, leg=FALSE),getGCargs(a[a$plate.name==mypn & a$drug1.conc==0,])))))
+```
+
+#### Remove bad controls
+Use a 95% confidence interval to determine which wells may be outliers. Use code in `controlQC` function in `diprate` package.
+```{r}
+ctrl_ids <- unique(a[a$drug1.conc==0,'uid'])
+
+ctrlQC <- function(dat)
+{
+    ids <- as.character(unique(dat$uid))
+    
+    m <- lm(log2(cell.count) ~ time * uid, data=dat)
+    rates <- coef(m)[grepl("time", names(coef(m)))]
+    rates <- c(rates[1], rates[-1] + rates[1])
+    ids.ok <- names(rates[rates < mean(rates) + sd(rates) & rates > 
+        mean(rates) - sd(rates)])
+    ids.ok <- gsub("time:uid", "", ids.ok)
+    ids.ok <- sub("time", ids[1], ids.ok)
+    out <- list(good_controls=ids.ok, outliers=setdiff(ids,ids.ok))
+    return(out)
+}
+
+
+```
+
+
+Assess controls and remove outliers from data.
+```{r}
+ctrl_quality <- lapply(unique(a$cell.line), function(cl) ctrlQC(a[a$cell.line==cl & a$drug1.conc==0,]))
+bad_ctrls <- unlist(sapply(ctrl_quality, '[[', 'outliers'))
+d <- d[!d$uid %in% bad_ctrls,]
+a <- d[grepl("^V2", d$plate.name),]
+```
+
+```{r fig.height=11, fig.width=8}
+par(mfcol=c(5,4))
+invisible(lapply(unique(a$plate.name), function(mypn) do.call(plotGC,append(
+    list(ylim=c(0,5), main=mypn, leg=FALSE),getGCargs(a[a$plate.name==mypn & a$drug1.conc==0,])))))
+```
+
+#### Examine growth curves
+Use a single drug to assess growth curves across all drug concentrations for each cell line.
+```{r Check drug QC, fig.height=2, fig.width=8}
+par(mfrow=c(1,4))
+invisible(lapply(unique(a[a$drug1=="VU0823511", 'plate.name']), function(pn) do.call(plotGC,append(
+    list(ylim=c(-2,5), main=pn, leg=FALSE),getGCargs(a[a$plate.name==pn & a$drug1=="VU0823511",])))))
+```
+
+#### Replace drug names
+Obtained, from Dave Westover, drug names to replace VU-specific identifiers. 
+
+```{r}
+new_drug_names <- readxl::read_xlsx("../data/VLW001_full_drugnames.xlsx")
+```
+
+Plan is to replace drug names by matching `d$drug1` to `new_drug_names$VU_ID` and replace with `new_drug_names$"Chemical Name"`. However, the chemical names need to be cleaned.
+
+```{r}
+new_drugs <- as.character(new_drug_names$"Chemical Name")
+```
+
+Algorithm:
+
+* split on `(`, keeping first part.
+* remove dashes
+* remove spaces if before numbers
+* split on spaces, keeping first part (remove salts)
+* If only first letter cap or if != "Ro", make lowercase
+
+```{r}
+temp <- sapply(strsplit(new_drugs, " (", fixed=TRUE), "[[", 1, simplify=TRUE)
+temp[grep(" [0-9]",temp)] <- gsub(" ", "", temp[grep(" [0-9]",temp)])
+temp <- gsub("-", "", temp)
+temp <- sapply(strsplit(temp, " "), "[[", 1, simplify=TRUE)
+temp[!grepl("Ro", temp) & grepl("^[A-Z][a-z]", temp)] <- 
+    tolower(temp[!grepl("Ro", temp) & grepl("^[A-Z][a-z]", temp)])
+new_drug_names$drug1 <- temp
+```
+
+Replace `d$drug1` values starting with `VU` with appropriate value in `new_drug_names$drug1` then subset data for 2D data only and save into object `a`. 
+
+Exclude `file_name` from Thunor data.
+```{r}
+d[grep("^VU",d$drug1), 'drug1'] <- 
+    new_drug_names[match(d[grep("^VU",d$drug1),'drug1'], new_drug_names$VU_ID),]$drug1
+
+a <- d[grepl("^V2", d$plate.name),]
+a <- a[,colnames(a)!="file_name"]
+```
+
+#### Save 2D data for Thunor
+
+```{r}
+OVERWRITE <- FALSE
+thunor_2D_dat <- a
+thunor_2D_dat$upid <- paste(thunor_2D_dat$expt.date, thunor_2D_dat$plate.name, sep='_')
+thunor_2D_dat$drug1.units <- 'M'
+thunor_fn <- "../data/VLW_V23ab_2Donly_Thunor_dataset.csv"
+if(!file.exists(thunor_fn) | OVERWRITE) write.csv(thunor_2D_dat, file=thunor_fn, row.names=FALSE)
+```
+
+#### Save all data (including file name with full path)
+
+```{r}
+alldat_fn <- "../data/VLW_V23ab_dataset.csv"
+if(!file.exists(alldat_fn) | OVERWRITE) write.csv(d, file=alldat_fn, row.names=FALSE)
+```
+

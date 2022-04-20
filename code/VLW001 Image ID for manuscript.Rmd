@@ -1,0 +1,84 @@
+---
+title: "Identify images for Kensey"
+output: html_notebook
+---
+### For Kensey Bergdorf manuscript
+Reviewers asked to see reference images in 3D of each cell line of the best-performing drugs.  
+
+Specific information from Kensey: One of the reviewers has asked for images from the top 3 compounds (bortezomib, cabazitaxel, and YM155) across the four cell lines. I just need a composite image from high concentration and low concentration for each drug in each line, so 8 images total.
+
+
+Choosing time points after 100 hours.
+```{r}
+d <- read.csv("../data/VLW_V23ab_dataset.csv", as.is=TRUE)
+d <- d[order(d$uid,d$time),]
+
+mydrugs <- c("bortezomib","cabazitaxel","YM155")
+z <- d[d$drug1 %in% mydrugs & grepl("V3",d$plate.name),]
+
+max_conc <- sapply(mydrugs, function(drug) max(d[d$drug1==drug,"drug1.conc"]))
+
+z <- z[z$drug1.conc %in% max_conc,]
+z <- z[z$time>100,]
+
+z$ucond <- paste(z$cell.line, z$drug1, sep="_")
+```
+
+#### Determine which image for each unique condition has highest cell count
+```{r}
+unique(z$ucond)
+```
+Missing 29T_bortezomib (see below); get images with highest cell count for others.
+```{r}
+a <- do.call(rbind, lapply(unique(z$ucond), function(cond)
+{
+    temp <- z[z$ucond==cond,]
+    temp[temp$orig.cell.count==max(temp$orig.cell.count),]
+}))
+```
+
+### Need other time points or conc
+Bortezomib in 29T was missing
+
+Needed to find an earlier time point (prior to 100 h)
+```{r}
+b <- d[d$drug1=="bortezomib" & d$drug1.conc %in% max_conc & d$cell.line=="29T" & grepl("V3", d$plate.name) & d$time>72,]
+b$ucond <- paste(b$cell.line,b$drug1,sep="_")
+```
+
+```{r}
+a <- rbind(a,b[1,])
+```
+
+Get control wells that correspond to the same times.
+
+```{r}
+ctrl <- do.call(rbind, apply(a[,c("plate.id","time")], 1, function(x) d[d$plate.id==x["plate.id"] & d$time==x["time"] & d$drug1.conc==0,]))
+ctrl$ucond <- paste(ctrl$cell.line, ctrl$drug1, sep="_")
+ucond_ctrl <- unique(ctrl$ucond)
+temp <- do.call(rbind, lapply(ucond_ctrl, function(cond) 
+{
+    x <- ctrl[ctrl$ucond==cond,]
+    x[x$orig.cell.count==max(x$orig.cell.count),]
+}))
+
+ctrl <- temp[!duplicated(temp$plate.id),]
+```
+
+Append control wells to drug treated wells
+```{r}
+a <- rbind(a,ctrl)
+a <- a[order(a$ucond),]
+rownames(a) <- NULL
+```
+
+### Show data to be saved
+```{r}
+a
+```
+
+### Write file
+```{r}
+write.csv(a, file="../data/VLW_images_Bergdorf_pub.csv", row.names=FALSE)
+```
+

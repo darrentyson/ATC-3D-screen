@@ -1,0 +1,267 @@
+---
+title: "Analysis of VLW 2Dvs3D combined data, part 2"
+output: 
+    html_notebook:
+        self_contained: yes
+author: "Darren R Tyson"
+date: "2021-02-15"
+---
+
+### Analysis of dead cell fractions
+In part 1 (`VLW_V23_combined_analysis.Rmd`), all data were organized to include drug annotation and image file paths, in addition to cell count and ch2-pos counts. Use these data to examine time and drug concentration effects on cell death kinetics.
+
+```{r Setup}
+library(diprate)
+
+OVERWRITE <- FALSE
+```
+
+For these analyses we do not need `file_name`
+```{r Load data}
+d <- read.csv("../data/VLW_V23ab_dataset.csv", as.is=TRUE)
+d <- d[order(d$uid,d$time),]
+d$file_name <- NULL
+```
+
+```{r Prep counts by cell line, include=FALSE}
+pd <- prepCountByCL(d[grepl("V2",d$plate.name),])
+```
+
+Examine the data from the previously identified hits. Focus on two cell lines. 16T best-looking 3D structures, 21T most clinically relevant, but worst looking and slowest growing.
+
+* pralatrexate (low potency) and ixazomib (high potency and efficacy) on 16T and 21T.
+
+```{r 2D data subset, message=FALSE, warning=FALSE}
+mydrugs <- c("bortezomib", "ixazomib", "YM155", "Zibotentan", "Romidepsin", "cabazitaxel", "delanzomib",
+             "ispinesib", "KX2391", "triptolide", "carfilzomib", "rigosertib", "pralatrexate")
+mycl <- c("16T","21T")
+s2d <- lapply(mycl, function(cl) d[d$drug1 %in% mydrugs & 
+                                      d$cell.line==cl & 
+                                      grepl("V2",d$uid),])
+```
+
+Save drug subsets into objects.
+
+```{r 2D data, message=FALSE, warning=FALSE}
+a <- subset(s2d[[1]], drug1 %in% mydrugs)
+b <- subset(s2d[[2]], drug1 %in% mydrugs)
+```
+
+
+```{r 3D data subset, message=FALSE, warning=FALSE}
+s3d <- lapply(mycl, function(n) d[d$drug1 %in% mydrugs & 
+                                      d$cell.line==n & 
+                                      grepl("V3",d$uid),])
+```
+
+#### Screen 3D data by cell count > 40
+Many 3D cultures had few, if any, cells in the field of view. Must exclude.
+```{r 3D data}
+a3 <- subset(s3d[[1]], drug1 %in% mydrugs & orig.cell.count >= 40)
+b3 <- subset(s3d[[2]], drug1 %in% mydrugs & orig.cell.count >= 40)
+```
+
+### 16T 2D
+Examine the death kinetics (fraction of ch2 positive cells over time).
+```{r 16T 2D, fig.height=5, fig.width=8}
+plotAllCh2(list("16T"=a), count_cn="orig.cell.count")
+```
+
+### 16T 3D
+```{r 16T 3D, fig.height=5, fig.width=8}
+plotAllCh2(list("16T"=a3), count_cn="orig.cell.count")
+```
+### 21T 2D
+```{r 21T 2D, fig.height=5, fig.width=8}
+plotAllCh2(list("21T"=b), count_cn="orig.cell.count")
+```
+
+### 21T 3D
+```{r 21T 3D, fig.height=5, fig.width=8}
+plotAllCh2(list("21T"=b3), count_cn="orig.cell.count")
+```
+
+
+### Apply simple logistic model to death kinetics data
+
+```{r logistic function}
+myl3 <- function(x, min=0,max=0.5,mid_x=48, dr=0.05) max/(1 + exp(-dr*(x-mid_x))) 
+```
+
+
+```{r test plot of logistic function}
+curve(myl3, from=0, to=120)
+```
+
+### Use DRC 3-param logistic function to fit data
+The `drc` library has a number of dose--response model fitting algorithms. The `L.3` model is a 3-parameter logistic (not log-logistic) model that can be applied to the time course data.  
+
+Test this with a subset of the data (21T + delanzomib).
+
+The model is trying to explain the change in dead cell fraction over time.
+
+```{r delanzomib}
+mydat <- b[b$drug1=="delanzomib",]
+test.m <- drc::drm(ch2.pos/orig.cell.count ~ time, factor(signif(log10(drug1.conc),3)), 
+                   data = mydat, fct = drc::L.3())
+
+plot(test.m, legendPos=c(20,0.85), log="")
+```
+### Extract maximum dead cell fraction from curves
+Pull from fit coefficients (upper bound; coefficient "d").
+```{r Max dead cell fraction}
+myconc <- names(coef(test.m))[grep("d",names(coef(test.m)))]
+myconc <- gsub("d:","",myconc)
+myconc <- as.numeric(myconc)
+
+plot(myconc, coef(test.m)[grep("d",names(coef(test.m)))], ylab="Max dead fraction", main="delanzomib")
+```
+### Examine an different drug
+Determine whether predicted time course trajectories match those of the ixazomib-treated cells.
+```{r ixazomib}
+mydat <- b[b$drug1=="ixazomib",]
+test.m <- drc::drm(ch2.pos/orig.cell.count ~ time, factor(signif(log10(drug1.conc),3)), 
+                   data = mydat, fct = drc::L.3())
+
+plot(test.m, legendPos=c(20,0.85), log="")
+```
+
+```{r Plot ixazomib DRC}
+plot(myconc, coef(test.m)[grep("d",names(coef(test.m)))], ylab="Max dead fraction", main="ixazomib")
+
+```
+
+This looks like it is working appropriately and the resultant dose--response curve could be fit by a LL4 model (lower bound should not be fixed to 0). However, the model fit values currently extend beyond the measured time range (e.g., Einf) and may not be accurate. A safer, albeit less elegant, way would be to simply capture the largest death fraction across the entire time course for each unique condition and plot those as the effect metric.
+
+```{r max death fraction}
+death_frac_max <- sapply(unique(d$uid), function(id) 
+{
+    z <- d[d$uid==id,]
+    z <- z[z$orig.cell.count !=0,]
+    out <- max(z$ch2.pos/z$orig.cell.count)
+    out[is.infinite(out)] <- NA
+    return(out)
+})
+names(death_frac_max) <- unique(d$uid)
+
+s <- d[!duplicated(d$uid),]
+
+# all(s$uid == names(death_frac_max))
+
+s$death.frac.max <- death_frac_max
+
+# Add 2D or 3D to cell line name to more easily distinguish
+s$cell.line <- paste0(s$cell.line,"_",substr(s$plate.name,2,2),"D")
+
+# Make cell.count into surviving percentage
+s$cell.count <- signif((1 - s$death.frac.max) * 100,3)
+
+# make time all 72h (not correct or relevant!)
+s$time <- 72
+```
+
+### Percent surviving dose--response curves
+Using 1 - max death fraction as the effect metric, fit a 4-parameter log-logistic model (LL.4). 
+```{r DFM DRC, warning=FALSE}
+k <- s[s$plate.name=="V2-11T-D3" & s$drug1=="ixazomib",]
+m <- drc::drm(cell.count ~ drug1.conc, data = k, fct = drc::LL.4())
+plot(m, type="all", ylim=c(0,100), ylab="Percent surviving")
+```
+
+### Iterate over unique drugs and plates (cell line and condition)
+```{r All drugs surviving fraction, message=FALSE, warning=FALSE}
+alldrugs <- unique(d$drug1)[-1] # remove "control"
+all.m <- lapply(alldrugs, function(drug)
+{
+    z <- s[s$drug1==drug,]
+    ucl <- unique(z$cell.line)
+    cld <- lapply(ucl, function(cl) 
+    {
+        dtf <- z[z$cell.line==cl,]
+        out <- tryCatch({drc::drm(cell.count ~ drug1.conc, data = dtf, fct = drc::LL.4())},
+                 error=function(cond) {NA})
+        return(out) 
+    })
+    names(cld) <- ucl
+    return(cld)
+})
+
+names(all.m) <- alldrugs
+```
+
+```{r plot DRC}
+plotMultiCurve(unlist(all.m, recursive=FALSE)[9:16], ylim=c(0,100))
+```
+
+### Save surviving percentage data for Thunor
+Still need unique plate id (`upid`) 
+```{r Save surv for Thunor}
+s$upid <- paste(s$expt.id,s$plate.name,sep="_")
+
+# remove NAs
+s <- s[!is.na(s$cell.count),]
+
+fn <- "../data/VLW_001+V23b_SurvPct_Thunor_dataset.csv"
+
+if(!file.exists(fn) | OVERWRITE) write.csv(s, file=fn, row.names=FALSE)
+```
+
+### Import Thunor curve-fit data
+Data uploaded to Thunor (`VLW_SurvPercent`) were processed and the `Viability Parameters` were downloaded as .
+
+```{r}
+v <- read.csv('../data/VLW_SurvPercent_viability_params.tsv', sep="\t")
+```
+
+Order the drugs by `aa_obs` (highest to lowest) and save subset with `aa_obs < 0.5` to object `b`. Count how many of each cell line are found in this subset (looking for bias in cell lines or 2D/3D condition)
+```{r}
+v <- v[order(v$aa_obs, decreasing=TRUE),]
+b <- v[v$aa_obs > 0.5,]
+diprate::nEach(b$cell_line)
+```
+16T_3D looks overrepresented and 29T_3D looks underrepresented.
+
+```{r}
+b[b$cell_line=="29T_3D",]
+```
+
+### Sort values by drugs
+Looks at sum of aa_obs as metric of overall effect.
+Also get sd to assess similarity across cell lines and 2D/3D.
+```{r}
+k <- lapply(unique(v$drug), function(x) 
+              v[v$drug==x,c("cell_line","aa_obs")])
+names(k) <- as.character(unique(v$drug))
+
+a <- sapply(names(k), function(x) sum(k[[x]]$aa_obs))
+a <- sort(a, decreasing=TRUE)
+
+# reorder k to match a
+k <- k[names(a)]
+
+std.dev <- sapply(names(k), function(x) sd(k[[x]]$aa_obs))
+cv <- sapply(names(k), function(x) sd(k[[x]]$aa_obs)/mean(k[[x]]$aa_obs))
+
+av <- list(orig.data=k, sum.aa_obs=a, std.dev=std.dev, cv=cv)
+
+```
+
+### Include DIP rate-based (observed) Emax values from 2D condition for each cell line
+First, load all DIP rate-based parameters (DIP parameters downloaded from [DipDB](https://dipdb.lolab.xyz/dataset/193)). Extract the `emax_obs` values from each cell line for each drug as a new data.frame (saved in `emo` for emax_obs).
+
+```{r}
+d <- read.csv("../data/VLW_23ab_2D_only_dip_params.tsv", sep="\t", as.is=TRUE)
+
+# emo = emax_obs
+emo <- data.frame(do.call(rbind,lapply(unique(d$drug), function(x) d[d$drug==x,"emax_obs"])))
+colnames(emo) <- paste0("emax_obs_",unique(d$cell_line))
+rownames(emo) <- unique(d$drug)
+```
+
+Organize a data.frame to save for Kensey and Vivian.
+```{r}
+o <- data.frame(viability.aa_obs.sum=a, viability.aa_obs.std.dev=std.dev, viability.aa_obs.cv=cv)
+if(!file.exists(fn) | OVERWRITE) write.csv(o, file="../data/max_death_DRC_params.csv", row.names=FALSE)
+head(o)
+```
+
